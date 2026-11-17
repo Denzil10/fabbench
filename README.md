@@ -13,7 +13,7 @@ Write-up: [My LLM judges passed a false 'verified live' 11 times in 12. My promp
 | `cases.jsonl` | one case per line: `id`, `date`, `system`, `claim`, `truth`, `label`, `kind`, `caught_by`, `would_catch`, `added_in` (the batch it was written in) |
 | `evidence/<id>.md` | what an outside check could read at claim time. Each section names where it came from and when (`Source:`). No later audit conclusions |
 | `judge-prompt-v1.md` … `v5.md` | the five judge prompts, each frozen before the batch of cases it was tested on |
-| `results/*.json` | every scored run: predictions, the label per run, the judge's raw replies, the command, date and CLI version |
+| `results/*.json` | the latest set of runs per judge (three per prompt and model; earlier sets were overwritten when a prompt was rerun): predictions, the label per run, the judge's raw replies, the command, date and CLI version |
 | `results/README.md` | the results table and a confusion table per judge |
 | `bench.py` | the runner and scorer (Python 3.10+, standard library only) |
 
