@@ -3,7 +3,10 @@
 
   python3 bench.py check                      # rerun the built-in judges and confirm results/ reproduces
   python3 bench.py run [--judge NAME]          # rerun flag-all, trust-all and rules; rewrite results/
-  python3 bench.py run --cmd "COMMAND" --name MODEL_prompt-vN --prompt vN [--runs N] [--workers N]
+  python3 bench.py run --cmd "COMMAND" --name MODEL_prompt-vN --prompt vN [--runs N] [--workers N] [--add]
+
+--add pools the new runs with the judge's stored runs (another day, same input hash); the table then lists
+the cases whose majority label differs between days.
 
 A command judge reads the filled prompt on stdin and prints a label; the last label word it prints wins.
 Standard library only; paths are relative to this file.
@@ -185,10 +188,51 @@ def pool(name: str, runs: list[dict]) -> dict:
     return res
 
 
+def unpool(res: dict) -> list[dict]:
+    """The per-run results a stored judge file was pooled from, rebuilt from its labels_by_run (enough to pool again).
+    Each rebuilt run must reproduce the stored per-run scores, or the file is not what this set of cases scored."""
+    rows = cases()
+    held = [r for r in rows if r.get("added_in", 1) >= res["held_out_from"]]
+    out = []
+    for k in range(res["runs"]):
+        preds = {r["id"]: res["labels_by_run"][r["id"]][k] for r in rows}
+        one = {"held_out_from": res["held_out_from"], "predictions": preds, **score(preds, rows)}
+        if held:
+            one["held_out"] = {m: v for m, v in score(preds, held).items() if m in METRICS}
+        if res.get("replies_by_run"):
+            one["replies"] = res["replies_by_run"][k]
+        for m in METRICS:
+            if one[m] != res[m + "_per_run"][k] or (held and one["held_out"][m] != res["held_out_per_run"][k][m]):
+                raise ValueError(f"{res['judge']} run {k + 1}: stored {m} does not match its labels")
+        out.append(one)
+    return out
+
+
+SAME_INPUT = ("judge", "prompt", "input_sha256", "command", "held_out_from")
+
+
+def combine(earlier: dict, later: dict) -> dict:
+    """Pool two stored results of one judge on byte-identical input (e.g. two days), keeping each run's date and CLI."""
+    for k in SAME_INPUT:
+        if earlier.get(k) != later.get(k):
+            raise ValueError(f"cannot pool {earlier.get('judge')}: '{k}' differs ({earlier.get(k)!r} vs {later.get(k)!r})")
+    by_run = lambda r, k: r.get(k + "_by_run") or [r.get(k)] * r["runs"]  # noqa: E731
+    runs = unpool(earlier) + unpool(later)
+    meta = {k: later[k] for k in ("command", "ran", "runs", "prompt", "input_sha256", "claude_cli") if k in later}
+    meta["ran_by_run"] = by_run(earlier, "ran") + by_run(later, "ran")
+    if "claude_cli" in later:
+        meta["claude_cli_by_run"] = by_run(earlier, "claude_cli") + by_run(later, "claude_cli")
+    return {**meta, **pool(later["judge"], runs), "runs_planned": len(runs)}
+
+
 def run(name: str, judge, meta: dict | None = None, runs: int = 1, workers: int = 1, held_out_from: int = HELD_OUT_FROM["rules"],
-        clean=None) -> dict:
+        clean=None, add: bool = False) -> dict:
+    """add: pool the new runs with the ones already stored for this judge, which must have read identical input."""
     RESULTS.mkdir(exist_ok=True)
     path = RESULTS / f"{name}.json"
+    stored = json.loads(path.read_text()) if add else None
+    if stored and stored.get("input_sha256") != (meta or {}).get("input_sha256"):
+        raise ValueError(f"{name}: stored input {stored.get('input_sha256')} is not today's {(meta or {}).get('input_sha256')}; runs not comparable")
     if runs == 1:
         result = {**evaluate(name, judge, workers, held_out_from, clean), **(meta or {})}
         path.write_text(json.dumps(result, indent=1) + "\n")
@@ -198,6 +242,8 @@ def run(name: str, judge, meta: dict | None = None, runs: int = 1, workers: int 
         done.append(evaluate(name, judge, workers, held_out_from, clean))
         # written after every run, so a killed job still leaves the runs it finished
         result = {**(meta or {}), **pool(name, done), "runs_planned": runs}
+        if stored:
+            result = combine(stored, result)
         path.write_text(json.dumps(result, indent=1) + "\n")
         print(f"{name} run {k + 1}/{runs}: " + ", ".join(f"{m} {frac(done[-1][m])}" for m in METRICS), flush=True)
     return result
@@ -233,7 +279,8 @@ def table() -> str:
     lines[-2] = "| judge | runs | recall | false flags | exact label | held out: false flags | held out: exact | fb-102 | fb-104 |"
     lines[-1] = "|---" * 9 + "|"
     for r in results:
-        lines.append(f"| {r['judge']} | {r.get('runs', 1)} | {cell(r, 'recall')} | {cell(r, 'false_flags')} | {cell(r, 'exact_label')} | "
+        days = sorted(set(r.get("ran_by_run", [])))
+        lines.append(f"| {r['judge']} | {r.get('runs', 1)}{f' ({len(days)} days)' if len(days) > 1 else ''} | {cell(r, 'recall')} | {cell(r, 'false_flags')} | {cell(r, 'exact_label')} | "
                      f"{cell(r, 'false_flags', True)} | {cell(r, 'exact_label', True)} | {r['fb-102']} | {r['fb-104']} |")
     for r in results:
         cols = [c for c in LABELS + ["no-answer"] if any(r["confusion"][t][c] for t in LABELS)]
@@ -249,7 +296,26 @@ def table() -> str:
         if r.get("runs", 1) > 1:
             moved = [f"{i} ({' / '.join(r['labels_by_run'][i])})" for i in r["moved"]]
             lines += ["", f"Label moved between runs ({len(moved)} of {r['cases']}): " + (", ".join(moved) or "none") + "."]
+            days = sorted(set(r.get("ran_by_run", [])))
+            if len(days) > 1:
+                lines += ["", "Majority label by day, on identical input (" + ", ".join(days) + "): "
+                          + (", ".join(f"{i} ({' / '.join(v)})" for i, v in day_flips(r).items()) or "the same on every case") + "."]
     return "\n".join(lines) + "\n"
+
+
+def day_flips(r: dict) -> dict[str, list[str]]:
+    """Cases whose majority label differs between the days a pooled judge ran (`split` when no label has over half)."""
+    days = sorted(set(r["ran_by_run"]))
+    out = {}
+    for i, seen in r["labels_by_run"].items():
+        per_day = []
+        for d in days:
+            day = [lab for lab, ran in zip(seen, r["ran_by_run"]) if ran == d]
+            top = max(set(day), key=day.count)
+            per_day.append(top if day.count(top) * 2 > len(day) else "split")
+        if len(set(per_day)) > 1:
+            out[i] = per_day
+    return out
 
 
 BUILT_IN_KEYS = ("judge", "cases", "held_out_from", "predictions", "recall", "false_flags", "exact_label",
@@ -290,6 +356,7 @@ def parser() -> argparse.ArgumentParser:
     r.add_argument("--name", help="results name for --cmd: the model id and prompt version")
     r.add_argument("--runs", type=int, default=1, help="repeat a command judge N times on identical input (default 1)")
     r.add_argument("--prompt", choices=sorted(PROMPTS), default="v1", help="judge prompt version for --cmd (default v1)")
+    r.add_argument("--add", action="store_true", help="pool the new runs with this judge's stored runs (identical input required)")
     r.add_argument("--workers", type=int, default=1, help="cases judged in parallel by a command judge (default 1)")
     return ap
 
@@ -308,7 +375,7 @@ def run_judges(ap: argparse.ArgumentParser, args, clean=None) -> int:
     for name, judge in todo.items():
         try:
             res = run(name, judge, meta, args.runs if args.cmd else 1, args.workers if args.cmd else 1,
-                      HELD_OUT_FROM[args.prompt] if args.cmd else HELD_OUT_FROM["rules"], clean)
+                      HELD_OUT_FROM[args.prompt] if args.cmd else HELD_OUT_FROM["rules"], clean, bool(args.cmd and args.add))
         except JudgeError as e:
             print(f"{name}: judge failed, run not scored: {e}")
             return 1
