@@ -1,6 +1,6 @@
 {
  "judge": "rules",
- "cases": 30,
+ "cases": 34,
  "held_out_from": 4,
  "predictions": {
   "fb-001": "fabricated",
@@ -32,19 +32,23 @@
   "fb-016": "verified",
   "fb-112": "verified",
   "fb-113": "verified",
-  "fb-114": "honest-unknown"
+  "fb-114": "honest-unknown",
+  "fb-017": "verified",
+  "fb-018": "verified",
+  "fb-115": "verified",
+  "fb-116": "verified"
  },
  "recall": [
   8,
-  15
+  17
  ],
  "false_flags": [
   3,
-  15
+  17
  ],
  "exact_label": [
-  18,
-  30
+  20,
+  34
  ],
  "fb-102": "verified",
  "fb-104": "honest-unknown",
@@ -101,7 +105,7 @@
    "unsupported": 1,
    "honest-unknown": 0,
    "honest-weak": 0,
-   "verified": 5,
+   "verified": 7,
    "no-answer": 0
   },
   "honest-unknown": {
@@ -134,22 +138,22 @@
    "unsupported": 3,
    "honest-unknown": 0,
    "honest-weak": 0,
-   "verified": 8,
+   "verified": 10,
    "no-answer": 0
   }
  },
  "held_out": {
   "recall": [
    0,
-   5
+   7
   ],
   "false_flags": [
    2,
-   10
+   12
   ],
   "exact_label": [
-   7,
-   15
+   9,
+   19
   ]
  },
  "rules": [
@@ -226,6 +230,10 @@
   "fb-016": "none (default verified)",
   "fb-112": "none (default verified)",
   "fb-113": "none (default verified)",
-  "fb-114": "claim names its own uncertainty"
+  "fb-114": "claim names its own uncertainty",
+  "fb-017": "none (default verified)",
+  "fb-018": "none (default verified)",
+  "fb-115": "none (default verified)",
+  "fb-116": "none (default verified)"
  }
 }

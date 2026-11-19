@@ -3,10 +3,12 @@
 
   python3 bench.py check                      # rerun the built-in judges and confirm results/ reproduces
   python3 bench.py run [--judge NAME]          # rerun flag-all, trust-all and rules; rewrite results/
-  python3 bench.py run --cmd "COMMAND" --name MODEL_prompt-vN --prompt vN [--runs N] [--workers N] [--add]
+  python3 bench.py run --cmd "COMMAND" --name MODEL_prompt-vN --prompt vN [--runs N] [--workers N] [--add] [--slice N]
 
 --add pools the new runs with the judge's stored runs (another day, same input hash); the table then lists
 the cases whose majority label differs between days.
+--slice N scores a command judge on the cases with added_in N only and writes results/slice-N/, so a new
+held-out batch can be read without replacing the whole-set results in results/.
 
 A command judge reads the filled prompt on stdin and prints a label; the last label word it prints wins.
 Standard library only; paths are relative to this file.
@@ -35,8 +37,14 @@ POSITIVE = {"fabricated", "self-certified", "tampered", "unsupported", "spec-gap
 NEGATIVE = {"verified", "honest-weak", "honest-unknown"}
 
 
-def cases() -> list[dict]:
-    return [json.loads(l) for l in CASES.read_text().splitlines() if l.strip()]
+def cases(slice: int | None = None) -> list[dict]:
+    """Every case, or with slice N only the cases added in batch N."""
+    rows = [json.loads(l) for l in CASES.read_text().splitlines() if l.strip()]
+    return rows if slice is None else [r for r in rows if r.get("added_in", 1) == slice]
+
+
+def results_dir(slice: int | None = None) -> pathlib.Path:
+    return RESULTS if slice is None else RESULTS / f"slice-{slice}"
 
 
 LABELS = sorted(POSITIVE) + sorted(NEGATIVE)
@@ -114,9 +122,9 @@ def cmd_judge(command: str, prompt: str = "v1", timeout: int = 300):
     return judge
 
 
-def input_sha256(prompt: str = "v1") -> str:
+def input_sha256(prompt: str = "v1", slice: int | None = None) -> str:
     """Hash of everything a judge reads (prompt template plus every judge input), so runs are comparable."""
-    blob = PROMPTS[prompt].read_text() + "".join(json.dumps(judge_input(r), sort_keys=True) for r in cases())
+    blob = PROMPTS[prompt].read_text() + "".join(json.dumps(judge_input(r), sort_keys=True) for r in cases(slice))
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
@@ -145,11 +153,14 @@ def judge_all(judge, rows: list[dict], workers: int = 1) -> dict:
         return dict(zip([i["id"] for i in inputs], pool.map(judge, inputs)))
 
 
-def evaluate(name: str, judge, workers: int = 1, held_out_from: int = HELD_OUT_FROM["rules"], clean=None) -> dict:
-    rows = cases()
-    out = judge_all(judge, rows, workers)  # always the whole set, never a subset
+def evaluate(name: str, judge, workers: int = 1, held_out_from: int = HELD_OUT_FROM["rules"], clean=None,
+             slice: int | None = None) -> dict:
+    rows = cases(slice)
+    out = judge_all(judge, rows, workers)  # the whole set, or one whole slice; never a hand-picked subset
     preds = {i: o[0] if isinstance(o, tuple) else o for i, o in out.items()}
     result = {"judge": name, "cases": len(rows), "held_out_from": held_out_from, "predictions": preds, **score(preds, rows)}
+    if slice is not None:
+        result["slice"] = slice
     held = [r for r in rows if r.get("added_in", 1) >= held_out_from]
     if held:
         result["held_out"] = {k: v for k, v in score(preds, held).items() if k in ("recall", "false_flags", "exact_label")}
@@ -168,8 +179,10 @@ METRICS = ("recall", "false_flags", "exact_label")
 def pool(name: str, runs: list[dict]) -> dict:
     """N runs of one judge on identical input. Scores are pooled over runs (k/(N*n)) with the per-run
     range kept; a case's label is the majority over runs, or "split" when no label has more than half."""
-    rows = cases()
+    rows = cases(runs[0].get("slice"))
     res = {"judge": name, "cases": len(rows), "held_out_from": runs[0]["held_out_from"], "runs": len(runs), "predictions": {}, "labels_by_run": {}}
+    if runs[0].get("slice") is not None:
+        res["slice"] = runs[0]["slice"]
     for r in rows:
         seen = [run_["predictions"][r["id"]] for run_ in runs]
         top = max(set(seen), key=seen.count)
@@ -191,12 +204,17 @@ def pool(name: str, runs: list[dict]) -> dict:
 def unpool(res: dict) -> list[dict]:
     """The per-run results a stored judge file was pooled from, rebuilt from its labels_by_run (enough to pool again).
     Each rebuilt run must reproduce the stored per-run scores, or the file is not what this set of cases scored."""
-    rows = cases()
+    # the cases it scored: a file from before a later batch was added covers fewer than cases() returns today
+    rows = [r for r in cases(res.get("slice")) if r["id"] in res["labels_by_run"]]
+    if len(rows) != res["cases"]:
+        raise ValueError(f"{res['judge']}: scored {res['cases']} cases, {len(rows)} of them are in cases.jsonl")
     held = [r for r in rows if r.get("added_in", 1) >= res["held_out_from"]]
     out = []
     for k in range(res["runs"]):
         preds = {r["id"]: res["labels_by_run"][r["id"]][k] for r in rows}
         one = {"held_out_from": res["held_out_from"], "predictions": preds, **score(preds, rows)}
+        if res.get("slice") is not None:
+            one["slice"] = res["slice"]
         if held:
             one["held_out"] = {m: v for m, v in score(preds, held).items() if m in METRICS}
         if res.get("replies_by_run"):
@@ -208,7 +226,7 @@ def unpool(res: dict) -> list[dict]:
     return out
 
 
-SAME_INPUT = ("judge", "prompt", "input_sha256", "command", "held_out_from")
+SAME_INPUT = ("judge", "prompt", "input_sha256", "command", "held_out_from", "slice")
 
 
 def combine(earlier: dict, later: dict) -> dict:
@@ -226,20 +244,20 @@ def combine(earlier: dict, later: dict) -> dict:
 
 
 def run(name: str, judge, meta: dict | None = None, runs: int = 1, workers: int = 1, held_out_from: int = HELD_OUT_FROM["rules"],
-        clean=None, add: bool = False) -> dict:
+        clean=None, add: bool = False, slice: int | None = None) -> dict:
     """add: pool the new runs with the ones already stored for this judge, which must have read identical input."""
-    RESULTS.mkdir(exist_ok=True)
-    path = RESULTS / f"{name}.json"
+    results_dir(slice).mkdir(parents=True, exist_ok=True)
+    path = results_dir(slice) / f"{name}.json"
     stored = json.loads(path.read_text()) if add else None
     if stored and stored.get("input_sha256") != (meta or {}).get("input_sha256"):
         raise ValueError(f"{name}: stored input {stored.get('input_sha256')} is not today's {(meta or {}).get('input_sha256')}; runs not comparable")
     if runs == 1:
-        result = {**evaluate(name, judge, workers, held_out_from, clean), **(meta or {})}
+        result = {**evaluate(name, judge, workers, held_out_from, clean, slice), **(meta or {})}
         path.write_text(json.dumps(result, indent=1) + "\n")
         return result
     done = []
     for k in range(runs):
-        done.append(evaluate(name, judge, workers, held_out_from, clean))
+        done.append(evaluate(name, judge, workers, held_out_from, clean, slice))
         # written after every run, so a killed job still leaves the runs it finished
         result = {**(meta or {}), **pool(name, done), "runs_planned": runs}
         if stored:
@@ -253,10 +271,10 @@ def frac(pair: list[int]) -> str:
     return f"{pair[0]}/{pair[1]}"
 
 
-def table() -> str:
-    results = [json.loads(p.read_text()) for p in sorted(RESULTS.glob("*.json"))]
-    rows = cases()
-    lines = ["# FabBench results", "",
+def table(slice: int | None = None) -> str:
+    results = [json.loads(p.read_text()) for p in sorted(results_dir(slice).glob("*.json"))]
+    rows = cases(slice)
+    lines = ["# FabBench results" + (f", slice {slice} only" if slice is not None else ""), "",
              f"{len(rows)} cases ({sum(r['label'] in POSITIVE for r in rows)} positive, {sum(r['label'] in NEGATIVE for r in rows)} negative).",
              "Recall: positives flagged with any positive label. False flags: negatives given a positive label.",
              "`rules` was written with every case visible, so its numbers are in-sample, not a held-out score.",
@@ -281,7 +299,7 @@ def table() -> str:
     for r in results:
         days = sorted(set(r.get("ran_by_run", [])))
         lines.append(f"| {r['judge']} | {r.get('runs', 1)}{f' ({len(days)} days)' if len(days) > 1 else ''} | {cell(r, 'recall')} | {cell(r, 'false_flags')} | {cell(r, 'exact_label')} | "
-                     f"{cell(r, 'false_flags', True)} | {cell(r, 'exact_label', True)} | {r['fb-102']} | {r['fb-104']} |")
+                     f"{cell(r, 'false_flags', True)} | {cell(r, 'exact_label', True)} | {r['fb-102'] or '-'} | {r['fb-104'] or '-'} |")
     for r in results:
         cols = [c for c in LABELS + ["no-answer"] if any(r["confusion"][t][c] for t in LABELS)]
         pooled = f", summed over {r['runs']} runs" if r.get("runs", 1) > 1 else ""
@@ -322,8 +340,12 @@ BUILT_IN_KEYS = ("judge", "cases", "held_out_from", "predictions", "recall", "fa
                  "fb-102", "fb-104", "confusion", "held_out", "rules", "fired")
 
 
+def slices() -> list[int]:
+    return sorted(int(p.name.split("-", 1)[1]) for p in RESULTS.glob("slice-*") if p.is_dir())
+
+
 def selfcheck() -> list[str]:
-    """Rerun the three built-in judges in memory and compare with results/; regenerate the table and compare."""
+    """Rerun the three built-in judges in memory and compare with results/; regenerate the tables and compare."""
     problems = []
     for name, judge in JUDGES.items():
         stored = json.loads((RESULTS / f"{name}.json").read_text())
@@ -333,12 +355,15 @@ def selfcheck() -> list[str]:
                 problems.append(f"{name}: '{k}' differs from results/{name}.json")
     if table() != (RESULTS / "README.md").read_text():
         problems.append("results/README.md differs from the table the stored results produce")
+    for s in slices():
+        if table(s) != (results_dir(s) / "README.md").read_text():
+            problems.append(f"results/slice-{s}/README.md differs from the table the stored results produce")
     return problems
 
 
-def cli_meta(command: str, prompt: str, runs: int) -> dict:
+def cli_meta(command: str, prompt: str, runs: int, slice: int | None = None) -> dict:
     meta = {"command": command.replace(str(pathlib.Path.home()), "~"), "ran": dt.date.today().isoformat(),
-            "runs": runs, "prompt": PROMPTS[prompt].name, "input_sha256": input_sha256(prompt)}
+            "runs": runs, "prompt": PROMPTS[prompt].name, "input_sha256": input_sha256(prompt, slice)}
     cli = re.search(r"(\S*/)?claude(?=\s)", command)
     if cli:  # model output can change with the CLI, so record which one ran
         ver = subprocess.run([str(pathlib.Path(cli.group(0)).expanduser()), "--version"], capture_output=True, text=True)
@@ -358,6 +383,7 @@ def parser() -> argparse.ArgumentParser:
     r.add_argument("--prompt", choices=sorted(PROMPTS), default="v1", help="judge prompt version for --cmd (default v1)")
     r.add_argument("--add", action="store_true", help="pool the new runs with this judge's stored runs (identical input required)")
     r.add_argument("--workers", type=int, default=1, help="cases judged in parallel by a command judge (default 1)")
+    r.add_argument("--slice", type=int, help="a command judge on the cases with added_in N only; writes results/slice-N/")
     return ap
 
 
@@ -367,20 +393,26 @@ def run_judges(ap: argparse.ArgumentParser, args, clean=None) -> int:
             ap.error("--cmd needs --name")
         if not args.name.endswith(f"_prompt-{args.prompt}"):
             ap.error(f"--name must end in _prompt-{args.prompt}, the prompt it ran")
+        if args.slice is not None and not cases(args.slice):
+            ap.error(f"--slice {args.slice}: no case has added_in {args.slice}")
         todo = {args.name: cmd_judge(args.cmd, args.prompt)}
-        meta = cli_meta(args.cmd, args.prompt, args.runs)
+        meta = cli_meta(args.cmd, args.prompt, args.runs, args.slice)
     else:
+        if args.slice is not None:
+            ap.error("--slice is for a command judge; the built-in judges always score the whole set")
         todo = {args.judge: JUDGES[args.judge]} if args.judge else JUDGES
         meta = None
     for name, judge in todo.items():
         try:
             res = run(name, judge, meta, args.runs if args.cmd else 1, args.workers if args.cmd else 1,
-                      HELD_OUT_FROM[args.prompt] if args.cmd else HELD_OUT_FROM["rules"], clean, bool(args.cmd and args.add))
+                      HELD_OUT_FROM[args.prompt] if args.cmd else HELD_OUT_FROM["rules"], clean, bool(args.cmd and args.add),
+                      args.slice if args.cmd else None)
         except JudgeError as e:
             print(f"{name}: judge failed, run not scored: {e}")
             return 1
         print(f"{name}: recall {frac(res['recall'])}, false flags {frac(res['false_flags'])}, exact {frac(res['exact_label'])}")
-    (RESULTS / "README.md").write_text(table())
+    slice = args.slice if args.cmd else None
+    (results_dir(slice) / "README.md").write_text(table(slice))
     return 0
 
 
