@@ -278,11 +278,13 @@ def table(slice: int | None = None) -> str:
              f"{len(rows)} cases ({sum(r['label'] in POSITIVE for r in rows)} positive, {sum(r['label'] in NEGATIVE for r in rows)} negative).",
              "Recall: positives flagged with any positive label. False flags: negatives given a positive label.",
              "`rules` was written with every case visible, so its numbers are in-sample, not a held-out score.",
-             "Model judges: each run covers the whole set on identical input (command, date, CLI version and input hash in their JSON). "
-             "A judge with N runs is pooled: k/(N x cases), the per-run range in brackets, and its label per case is the majority over runs (`split` when no label has more than half).", "",
-             "Held out: cases added after the judge's rules or prompt were frozen (`held_out_from` in its JSON). "
-             + "; ".join(f"`{k}`: {sum(r.get('added_in', 1) >= v for r in rows)} cases (added_in >= {v})" for k, v in HELD_OUT_FROM.items())
-             + ". A prompt with no held-out cases yet shows `-`: its whole score is in-sample.", "",
+             "Model judges: every run of a judge scores the same cases on identical input (command, date, CLI version and input hash in their JSON); "
+             "the `cases` column says how many. "
+             + ("A judge that ran before later batches were added scored fewer cases than the set has today"
+                + (" (later batches are scored on their own in " + ", ".join(f"`results/slice-{s}/`" for s in slices()) + ")" if slices() else "") + ". " if slice is None else "")
+             + "A judge with N runs is pooled: k/(N x cases), the per-run range in brackets, and its label per case is the majority over runs (`split` when no label has more than half).", "",
+             "Held out: cases added after the judge's rules or prompt were frozen (added_in >= `held_out_from` in its JSON); the `cases` column says how many of the cases it scored were held out. "
+             "A prompt with no held-out cases yet shows `-`: its whole score is in-sample.", "",
              "| judge | recall | false flags | exact label | held out: false flags | held out: exact | fb-102 | fb-104 |", "|---|---|---|---|---|---|---|---|"]
     def cell(r: dict, m: str, held: bool = False) -> str:
         pair = (r.get("held_out") or {}).get(m) if held else r[m]
@@ -294,11 +296,16 @@ def table(slice: int | None = None) -> str:
         lo, hi = min(x[0] for x in per), max(x[0] for x in per)
         return f"{frac(pair)} ({lo}/{per[0][1]} per run)" if lo == hi else f"{frac(pair)} ({lo}-{hi}/{per[0][1]} per run)"
 
-    lines[-2] = "| judge | runs | recall | false flags | exact label | held out: false flags | held out: exact | fb-102 | fb-104 |"
-    lines[-1] = "|---" * 9 + "|"
+    added = {x["id"]: x.get("added_in", 1) for x in rows}
+    def scored(r: dict) -> str:  # the cases this judge's runs covered, from its own file, not today's set
+        held = sum(added.get(i, 0) >= r["held_out_from"] for i in r["predictions"])
+        return f"{r['cases']} ({held} held out)"
+
+    lines[-2] = "| judge | runs | cases | recall | false flags | exact label | held out: false flags | held out: exact | fb-102 | fb-104 |"
+    lines[-1] = "|---" * 10 + "|"
     for r in results:
         days = sorted(set(r.get("ran_by_run", [])))
-        lines.append(f"| {r['judge']} | {r.get('runs', 1)}{f' ({len(days)} days)' if len(days) > 1 else ''} | {cell(r, 'recall')} | {cell(r, 'false_flags')} | {cell(r, 'exact_label')} | "
+        lines.append(f"| {r['judge']} | {r.get('runs', 1)}{f' ({len(days)} days)' if len(days) > 1 else ''} | {scored(r)} | {cell(r, 'recall')} | {cell(r, 'false_flags')} | {cell(r, 'exact_label')} | "
                      f"{cell(r, 'false_flags', True)} | {cell(r, 'exact_label', True)} | {r['fb-102'] or '-'} | {r['fb-104'] or '-'} |")
     for r in results:
         cols = [c for c in LABELS + ["no-answer"] if any(r["confusion"][t][c] for t in LABELS)]
